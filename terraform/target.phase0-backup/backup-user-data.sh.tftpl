@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# PQC-Bench target user-data
+# Builds OpenSSL ${openssl_version} + nginx ${nginx_version} + self-signed ML-DSA-65 cert
+# Then starts nginx-pq on :443 with TLS 1.3 group = ${tls_group}
+#
+# Logs go to /var/log/user-data.log for debugging.
+
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+
+echo "==> PQC-Bench bootstrap starting at $(date -u)"
+
+# ============================================================
+# 1. Base packages
+# ============================================================
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y --no-install-recommends \
+    build-essential libpcre3-dev zlib1g-dev wget curl ca-certificates \
+    linux-tools-common linux-tools-generic \
+    tcpdump jq unzip
+
+# perf tools for CPU profiling later (Phase 2, scenario 05)
+apt-get install -y --no-install-recommends "linux-tools-$(uname -r)" || true
+
+# ============================================================
+# 2. Build OpenSSL ${openssl_version}
+# ============================================================
+echo "==> Building OpenSSL ${openssl_version}"
+cd /usr/local/src
+wget -q "https://www.openssl.org/source/openssl-${openssl_version}.tar.gz"
+tar xf "openssl-${openssl_version}.tar.gz"
+cd "openssl-${openssl_version}"
+
+./Configure --prefix=/opt/openssl-${openssl_version} \
+            --openssldir=/opt/openssl-${openssl_version}/ssl \
+            --libdir=lib \
+            -Wl,-rpath,/opt/openssl-${openssl_version}/lib \
+            shared zlib
+
+# Use -j2 to avoid OOM on smaller instances; c7g.large has enough for -j$(nproc) but safe default
+make -j2
+make install_sw install_ssldirs
+
+# Register both possible lib paths (lib on ARM64/Debian, lib64 on some x86 builds)
+# Also register in ldconfig for other consumers (nginx build will find libs here too)
+echo "/opt/openssl-${openssl_version}/lib" > /etc/ld.so.conf.d/openssl-${openssl_version}.conf
+ldconfig
+
+OSSL=/opt/openssl-${openssl_version}/bin/openssl
+
+# Confirm the binary correctly links to our lib (via rpath) — not system's
+LDD_OUT=$(ldd $OSSL)
+echo "==> Dynamic linkage of new openssl binary:"
+echo "$LDD_OUT" | grep -E 'libssl|libcrypto'
+echo "$LDD_OUT" | grep libssl | grep -q "/opt/openssl-${openssl_version}/" \
+    || { echo "FATAL: openssl binary is picking up system libssl instead of the newly built one"; \
+         echo "       rpath may not have been baked in — check Configure step for -Wl,-rpath flag"; \
+         exit 1; }
+
+# Confirm the binary actually runs and reports the right version
+BUILT_VERSION=$($OSSL version 2>&1)
+echo "==> Built OpenSSL: $BUILT_VERSION"
+echo "$BUILT_VERSION" | grep -q "3\." \
+    || { echo "FATAL: openssl binary won't execute cleanly"; exit 1; }
+
+# Confirm PQ algorithms are compiled in
+$OSSL list -kem-algorithms | grep -qi "ML-KEM-768" \
+    || { echo "FATAL: OpenSSL built without ML-KEM-768"; exit 1; }
+$OSSL list -signature-algorithms | grep -qi "ML-DSA-65" \
+    || { echo "FATAL: OpenSSL built without ML-DSA-65"; exit 1; }
+
+echo "==> OpenSSL ${openssl_version} verified with PQ algorithms present"
+
+echo "==> OpenSSL ${openssl_version} built successfully"
+
+# ============================================================
+# 3. Build nginx ${nginx_version} against OpenSSL ${openssl_version}
+# ============================================================
+echo "==> Building nginx ${nginx_version}"
+cd /usr/local/src
+wget -q "https://nginx.org/download/nginx-${nginx_version}.tar.gz"
+tar xf "nginx-${nginx_version}.tar.gz"
+cd "nginx-${nginx_version}"
+
+./configure \
+  --prefix=/etc/nginx-pq \
+  --sbin-path=/usr/local/sbin/nginx-pq \
+  --conf-path=/etc/nginx-pq/nginx.conf \
+  --error-log-path=/var/log/nginx-pq/error.log \
+  --http-log-path=/var/log/nginx-pq/access.log \
+  --pid-path=/var/run/nginx-pq.pid \
+  --with-http_ssl_module \
+  --with-http_v2_module \
+  --with-openssl=/usr/local/src/openssl-${openssl_version} \
+  --with-cc-opt="-I/opt/openssl-${openssl_version}/include" \
+  --with-ld-opt="-L/opt/openssl-${openssl_version}/lib -Wl,-rpath,/opt/openssl-${openssl_version}/lib"
+
+make -j2
+make install
+
+mkdir -p /var/log/nginx-pq
+
+# Sanity: ML-KEM baked in?
+# Use `strings -a` to scan the whole file, not just loadable data sections.
+# On aarch64 the algorithm strings live in .rodata which default strings skips.
+# Confirm the binary was produced. The real ML-KEM verification happens later
+# via `nginx-pq -t` on the real config, which uses X25519MLKEM768. That check
+# is definitive: if ML-KEM wasn't compiled in, nginx -t fails there.
+test -x /usr/local/sbin/nginx-pq \
+    || { echo "FATAL: nginx-pq binary missing after make install"; exit 1; }
+echo "==> nginx-pq binary built and installed"
+
+echo "==> nginx-pq built successfully"
+
+# ============================================================
+# 4. Generate self-signed ML-DSA-65 cert
+# ============================================================
+echo "==> Generating self-signed ML-DSA-65 cert"
+mkdir -p /etc/pki/pq
+cd /etc/pki/pq
+
+# Get the instance's own IP for the SAN
+# Get the instance's own IP for the SAN. Ubuntu 24.04 defaults to IMDSv2-only,
+# which requires a token exchange — plain GETs fail silently and return empty.
+IMDS_TOKEN=$(curl -s -X PUT --max-time 5 \
+    "http://169.254.169.254/latest/api/token" \
+    -H "X-aws-ec2-metadata-token-ttl-seconds: 600" 2>/dev/null || echo "")
+
+if [ -n "$IMDS_TOKEN" ]; then
+    INSTANCE_IP=$(curl -s --max-time 5 \
+        -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+        http://169.254.169.254/latest/meta-data/local-ipv4 2>/dev/null || echo "")
+fi
+
+# Fallback if metadata lookup failed for any reason
+if [ -z "$INSTANCE_IP" ]; then
+    INSTANCE_IP=$(hostname -I | awk '{print $1}')
+fi
+if [ -z "$INSTANCE_IP" ]; then
+    INSTANCE_IP="127.0.0.1"
+fi
+echo "==> Using instance IP for cert SAN: $INSTANCE_IP"
+
+/opt/openssl-${openssl_version}/bin/openssl genpkey \
+    -algorithm ML-DSA-65 \
+    -out server-mldsa65.key
+
+/opt/openssl-${openssl_version}/bin/openssl req -new -x509 \
+    -key server-mldsa65.key \
+    -out server-mldsa65.crt \
+    -days 365 \
+    -subj "/CN=pqc-bench-target/O=PQC-Bench/C=US" \
+    -addext "subjectAltName=IP:$INSTANCE_IP,IP:127.0.0.1,DNS:localhost,DNS:pqc-bench-target"
+
+chmod 600 server-mldsa65.key
+chmod 644 server-mldsa65.crt
+
+# ============================================================
+# 5. Write nginx config
+# ============================================================
+echo "==> Writing nginx config with tls_group=${tls_group}"
+cat > /etc/nginx-pq/nginx.conf <<'NGINX_CONF'
+worker_processes auto;
+worker_rlimit_nofile 65536;
+error_log /var/log/nginx-pq/error.log warn;
+pid /var/run/nginx-pq.pid;
+
+events {
+    worker_connections 8192;
+    use epoll;
+    multi_accept on;
+}
+
+http {
+    access_log off;  # keep off during benchmarks; toggle on for troubleshooting
+
+    log_format pq '$remote_addr $time_iso8601 $request $status '
+                  'proto=$ssl_protocol cipher=$ssl_cipher '
+                  'curve=$ssl_curve reuse=$ssl_session_reused '
+                  'req_time=$request_time';
+
+    # Kernel-level tuning for TLS-heavy load
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    keepalive_requests 10000;
+
+    # SSL session cache — disabled for fresh-handshake scenarios;
+    # scenario 02 will toggle these on for resumption tests
+    ssl_session_cache off;
+    ssl_session_tickets off;
+
+    server {
+        listen 443 ssl reuseport backlog=16384;
+        listen [::]:443 ssl;
+        http2 on;
+        server_name _;
+
+        ssl_certificate     /etc/pki/pq/server-mldsa65.crt;
+        ssl_certificate_key /etc/pki/pq/server-mldsa65.key;
+
+        ssl_protocols TLSv1.3;
+        ssl_conf_command Groups TLS_GROUP_PLACEHOLDER;
+        ssl_conf_command SignatureAlgorithms ML-DSA-65:ed25519:ecdsa_secp256r1_sha256:ecdsa_secp384r1_sha384:rsa_pss_rsae_sha256;
+        ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256;
+
+        # Minimal payload for handshake-focused benchmarks
+        location / {
+            default_type text/plain;
+            return 200 "OK\n";
+        }
+
+        # Larger payload for payload-sweep scenarios (Phase 2 scenario 03)
+        location /1k    { default_type text/plain; return 200 "$request_body_placeholder_1k"; }
+        location /10k   { default_type text/plain; return 200 "$request_body_placeholder_10k"; }
+        location /100k  { default_type text/plain; return 200 "$request_body_placeholder_100k"; }
+
+        # Metadata endpoint — validators can hit this to confirm negotiation
+        location /negotiated {
+            default_type application/json;
+            return 200 '{"protocol":"$ssl_protocol","cipher":"$ssl_cipher","curve":"$ssl_curve","reuse":"$ssl_session_reused"}';
+        }
+    }
+}
+NGINX_CONF
+
+# Substitute the tls_group into the config (placeholder to avoid nginx var conflict)
+sed -i "s/TLS_GROUP_PLACEHOLDER/${tls_group}/" /etc/nginx-pq/nginx.conf
+
+# Definitive ML-KEM verification: this config uses X25519MLKEM768. If nginx-pq
+# was built without ML-KEM, this test fails with a clear error message.
+if ! /usr/local/sbin/nginx-pq -t 2>&1 | tee /tmp/nginx-t.out | grep -q "successful"; then
+    echo "FATAL: nginx-pq -t failed."
+    echo "If the error mentions the Groups directive or an unknown group name,"
+    echo "ML-KEM was not compiled in. See /tmp/nginx-t.out for full output."
+    cat /tmp/nginx-t.out
+    exit 1
+fi
+echo "==> nginx-pq config valid, X25519MLKEM768 accepted → ML-KEM confirmed"
+
+# ============================================================
+# 6. systemd unit + start
+# ============================================================
+cat > /etc/systemd/system/nginx-pq.service <<'UNIT'
+[Unit]
+Description=nginx-pq (PQC-Bench target)
+After=network.target
+
+[Service]
+Type=forking
+PIDFile=/var/run/nginx-pq.pid
+ExecStartPre=/usr/local/sbin/nginx-pq -t
+ExecStart=/usr/local/sbin/nginx-pq
+ExecReload=/usr/local/sbin/nginx-pq -s reload
+ExecStop=/usr/local/sbin/nginx-pq -s quit
+LimitNOFILE=65536
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable nginx-pq
+systemctl start nginx-pq
+
+# ============================================================
+# 7. Kernel network tuning for high connection rates
+# ============================================================
+cat > /etc/sysctl.d/99-pqc-bench.conf <<'SYSCTL'
+# TCP tuning for load-test targets
+net.core.somaxconn = 65535
+net.core.netdev_max_backlog = 16384
+net.ipv4.tcp_max_syn_backlog = 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_rmem = 4096 87380 16777216
+net.ipv4.tcp_wmem = 4096 65536 16777216
+SYSCTL
+sysctl --system
+
+# ============================================================
+# 8. Signal readiness
+# ============================================================
+# The presence of this file is the readiness flag — Terraform's remote-exec or
+# the Makefile's wait loop polls for it.
+touch /var/lib/pqc-bench-ready
+echo "==> PQC-Bench target ready at $(date -u), tls_group=${tls_group}"

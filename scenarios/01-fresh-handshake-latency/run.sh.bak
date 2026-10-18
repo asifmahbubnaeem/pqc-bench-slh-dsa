@@ -1,0 +1,151 @@
+#!/usr/bin/env bash
+# Scenario 01 driver — Java + Maven version.
+#
+# Runs the fresh-handshake-latency Gatling simulation twice on the loadgen:
+#   1. against target with tls_group=X25519 (classical baseline)
+#   2. against target with tls_group=X25519MLKEM768 (hybrid PQ)
+#
+# Between the two arms, applies terraform to swap the target's nginx config.
+# Same instance stays up so kernel/socket state carries.
+#
+# Cost per full run: ~$0.15 on c7g.large spot × 2 × ~40 min.
+#
+# Usage from project root:
+#   ./scenarios/01-fresh-handshake-latency/run.sh [rate] [trials]
+# Defaults: rate=1000 trials=3
+# Override MEASURE_SEC/WARMUP_SEC via env vars if you want shorter dry runs.
+
+set -euo pipefail
+
+RATE="${1:-1000}"
+TRIALS="${2:-3}"
+MEASURE_SEC="${MEASURE_SEC:-300}"
+WARMUP_SEC="${WARMUP_SEC:-30}"
+
+PROJECT_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+TF_DIR="$PROJECT_ROOT/terraform/bench"
+SCENARIO_DIR="$PROJECT_ROOT/scenarios/01-fresh-handshake-latency"
+RESULTS_DIR="$PROJECT_ROOT/results/$(date +%Y-%m-%d)-scenario-01-rate${RATE}"
+
+KEY_FILE="${SSH_KEY:-$HOME/.ssh/pqc-bench-key.pem}"
+
+mkdir -p "$RESULTS_DIR"
+echo "==> Results will land in: $RESULTS_DIR"
+
+LOADGEN_IP=$(cd "$TF_DIR" && terraform output -raw loadgen_public_ip)
+TARGET_PRIV=$(cd "$TF_DIR" && terraform output -raw target_private_ip)
+echo "==> Loadgen: $LOADGEN_IP   Target(priv): $TARGET_PRIV"
+
+# --- Upload the Java simulation into the loadgen's Gatling project ---
+# The AMI has /opt/gatling with the Maven project. We drop our simulation into
+# src/test/java/pqcbench/ then invoke mvnw with our simulationClass.
+echo "==> Uploading Java simulation to loadgen"
+ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no ubuntu@"$LOADGEN_IP" \
+    "mkdir -p /opt/gatling/src/test/java/pqcbench"
+scp -i "$KEY_FILE" -o StrictHostKeyChecking=no \
+    "$SCENARIO_DIR/gatling/src/test/java/pqcbench/FreshHandshakeLatency.java" \
+    ubuntu@"$LOADGEN_IP":/opt/gatling/src/test/java/pqcbench/
+
+# --- Ensure JAVA_HOME is exported on remote (belt-and-suspenders) ---
+REMOTE_ENV='export JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))'
+
+# --- Function: run one arm across N trials ---
+run_arm() {
+    local group="$1"        # X25519 or X25519MLKEM768
+    local tag="$2"          # classical or pq-mlkem
+    local trials="$3"
+
+    echo ""
+    echo "=================================================================="
+    echo "==> ARM: $tag  (Groups=$group)  trials=$trials"
+    echo "=================================================================="
+
+    echo "==> terraform apply — target tls_group=$group"
+    (cd "$TF_DIR" && terraform apply -auto-approve \
+        -var "tls_group=$group" 2>&1 | tail -3)
+
+    TARGET_IP=$(cd "$TF_DIR" && terraform output -raw target_public_ip)
+    echo "==> Waiting for target readiness"
+    for i in $(seq 1 30); do
+        if ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i "$KEY_FILE" \
+             ubuntu@"$TARGET_IP" "test -f /var/lib/pqc-bench-ready" 2>/dev/null; then
+            echo "==> Target ready after $((i*5))s"; break
+        fi
+        sleep 5
+    done
+
+    echo "==> Verify negotiation"
+    NEGOTIATED=$(ssh -i "$KEY_FILE" ubuntu@"$LOADGEN_IP" \
+        "/opt/openssl-3.5/bin/openssl s_client -connect $TARGET_PRIV:443 \
+         -groups $group -tls1_3 </dev/null 2>&1 | \
+         grep -iE 'sigalg:|verify return code|Server Temp Key|Cipher is' | head -3")
+    echo "$NEGOTIATED" | sed 's/^/    /'
+
+    for trial in $(seq 1 "$trials"); do
+        echo ""
+        echo "==> Trial $trial/$trials  arm=$tag"
+        local trial_results="$RESULTS_DIR/$tag/trial-$trial"
+        mkdir -p "$trial_results"
+
+        # Gatling invocation via mvnw.
+        # -Dgatling.http.ssl.trustAll=true skips cert verification client-side
+        # (probing self-signed ML-DSA-65 cert, trust is not the measurement).
+        ssh -i "$KEY_FILE" ubuntu@"$LOADGEN_IP" "
+            $REMOTE_ENV
+            cd /opt/gatling
+            rm -rf target/gatling
+            ./mvnw -B \
+                -Dgatling.simulationClass=pqcbench.FreshHandshakeLatency \
+                -Dtarget='https://$TARGET_PRIV:443' \
+                -Drate=$RATE \
+                -DmeasureSec=$MEASURE_SEC \
+                -DwarmupSec=$WARMUP_SEC \
+                -Dtag=$tag \
+                -Dgatling.http.ssl.trustAll=true \
+                gatling:test 2>&1 | tail -30
+        "
+
+        # Gatling writes to /opt/gatling/target/gatling/freshhandshakelatency-<ts>/
+        LATEST_RUN=$(ssh -i "$KEY_FILE" ubuntu@"$LOADGEN_IP" \
+            "ls -td /opt/gatling/target/gatling/freshhandshakelatency-* 2>/dev/null | head -1")
+        if [ -z "$LATEST_RUN" ]; then
+            echo "!! No Gatling results found — trial failed"
+            continue
+        fi
+        echo "==> Pulling $LATEST_RUN"
+        scp -qr -i "$KEY_FILE" ubuntu@"$LOADGEN_IP":"$LATEST_RUN"/* "$trial_results/"
+
+        cat > "$trial_results/meta.json" <<META
+{
+  "arm": "$tag",
+  "tls_group": "$group",
+  "rate_rps": $RATE,
+  "measure_sec": $MEASURE_SEC,
+  "warmup_sec": $WARMUP_SEC,
+  "trial": $trial,
+  "target_private_ip": "$TARGET_PRIV",
+  "negotiated_verification": $(printf '%s' "$NEGOTIATED" | jq -Rs .),
+  "timestamp_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+META
+        echo "==> Trial $trial done  →  $trial_results"
+    done
+}
+
+echo ""
+echo "==> Scenario 01: fresh-handshake latency"
+echo "    rate=$RATE rps  measure=${MEASURE_SEC}s  warmup=${WARMUP_SEC}s  trials=$TRIALS/arm"
+
+run_arm "X25519"          "classical" "$TRIALS"
+run_arm "X25519MLKEM768"  "pq-mlkem"  "$TRIALS"
+
+echo ""
+echo "=================================================================="
+echo "==> Done. Results in: $RESULTS_DIR"
+echo "=================================================================="
+find "$RESULTS_DIR" -name simulation.log | sed 's/^/    /'
+echo ""
+echo "==> Next: analysis"
+echo "    cd analysis && jupyter lab 01-fresh-handshake-latency.ipynb"
+echo ""
+echo "==> Remember to teardown when done:  make bench-down"

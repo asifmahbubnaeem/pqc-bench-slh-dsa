@@ -1,0 +1,27 @@
+# Copy this to terraform.tfvars and fill in your values.
+# terraform.tfvars is in .gitignore — safe for personal secrets.
+
+# AWS profile name (from `aws configure --profile pqc-bench`)
+profile = "pqc-bench"
+
+# Region — default us-east-1 is cheapest; override if you want closer to home
+region = "us-east-1"
+
+# Your existing EC2 key pair name (must exist in the region above)
+# Create with: aws --profile pqc-bench ec2 import-key-pair \
+#              --region us-east-1 --key-name pqc-bench-key \
+#              --public-key-material fileb://~/.ssh/id_ed25519.pub
+key_name = "pqc-bench-key"
+
+# Your laptop's public IP for SSH access. Get it with: curl ifconfig.me
+# Add /32 for a single IP. Never use 0.0.0.0/0.
+allowed_ssh_cidrs = ["203.0.113.42/32"]
+
+# Instance choice — Graviton c7g.large is the default and cheapest
+instance_type         = "c7g.large"
+instance_architecture = "arm64"
+
+# TLS group to configure on the target. Toggle between benchmarks:
+#   "X25519MLKEM768"  — hybrid PQ (the thing we're measuring)
+#   "X25519"          — classical baseline
+tls_group = "X25519MLKEM768"

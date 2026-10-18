@@ -1,0 +1,47 @@
+# Terraform
+**/.terraform/
+**/.terraform.lock.hcl
+**/terraform.tfstate
+**/terraform.tfstate.backup
+**/terraform.tfvars
+**/*.tfplan
+
+# Local secrets
+*.pem
+.aws-credentials
+
+# Python / Jupyter
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+.venv/
+venv/
+**/env/
+# Gatling / JMeter local artifacts
+target/
+*.jtl
+gatling-report/
+
+# OS
+.DS_Store
+Thumbs.db
+.ami-id
+results/*/*/trial-*/simulation.log
+
+# Benchmark output
+results/
+results-*.tar.gz
+
+# Phase 3 — regional AMIs and local state
+terraform/phase-3/.terraform/
+terraform/phase-3/.terraform.lock.hcl
+terraform/phase-3/terraform.tfstate
+terraform/phase-3/terraform.tfstate.backup
+terraform/phase-3/terraform.tfvars
+
+# Scenario 04 raw results
+results/*-scenario-04-*
+
+# Sed backup files
+*.tf.bak
+*.tftpl.bak

@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+echo "==> Loadgen FAST bootstrap at $(date -u) (AMI mode)"
+
+# Nothing to install — AMI already has OpenSSL 3.5 + Java + Gatling (or partial).
+# Just signal ready.
+touch /var/lib/pqc-bench-ready
+echo "==> READY at $(date -u)"

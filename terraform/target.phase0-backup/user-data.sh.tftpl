@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+echo "==> Base bootstrap starting at $(date -u)"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y --no-install-recommends \
+    build-essential libpcre3-dev zlib1g-dev wget curl ca-certificates \
+    tcpdump jq unzip
+
+touch /var/lib/pqc-bench-base-ready
+echo "==> Base ready at $(date -u). SSH in to finish setup manually."

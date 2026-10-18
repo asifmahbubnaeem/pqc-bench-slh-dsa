@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# PQC-Bench loadgen user-data
+# Phase 4 add: liboqs + oqsprovider so OpenSSL 3.5.2 can be a TLS client
+#              for SLH-DSA cert verification.
+# Installs Java 21, Gatling, JMeter (dormant from Phase 2 onward), and
+# OpenSSL 3.5.2 with oqsprovider (primary TLS client from scenario 04).
+
+set -euo pipefail
+exec > >(tee -a /var/log/user-data.log) 2>&1
+
+echo "==> PQC-Bench loadgen bootstrap starting at $(date -u)"
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y
+apt-get install -y --no-install-recommends \
+    openjdk-21-jre-headless wget curl ca-certificates unzip jq \
+    build-essential libpcre3-dev zlib1g-dev git \
+    cmake ninja-build
+
+# ============================================================
+# Install Gatling (dormant Phase 2+; scenario 01 only)
+# ============================================================
+GATLING_VERSION="${gatling_version}"
+cd /opt
+wget -q "https://repo1.maven.org/maven2/io/gatling/highcharts/gatling-charts-highcharts-bundle/$GATLING_VERSION/gatling-charts-highcharts-bundle-$GATLING_VERSION-bundle.zip" \
+    -O /tmp/gatling.zip
+unzip -q /tmp/gatling.zip -d /opt/
+mv "/opt/gatling-charts-highcharts-bundle-$GATLING_VERSION" /opt/gatling
+rm /tmp/gatling.zip
+ln -s /opt/gatling/bin/gatling.sh /usr/local/bin/gatling
+
+# ============================================================
+# Install JMeter (secondary — cross-validation only)
+# ============================================================
+JMETER_VERSION="${jmeter_version}"
+cd /opt
+wget -q "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-$JMETER_VERSION.tgz" \
+    -O /tmp/jmeter.tgz
+tar xf /tmp/jmeter.tgz -C /opt/
+mv "/opt/apache-jmeter-$JMETER_VERSION" /opt/jmeter
+rm /tmp/jmeter.tgz
+ln -s /opt/jmeter/bin/jmeter /usr/local/bin/jmeter
+
+# ============================================================
+# Install OpenSSL 3.5.2 — primary TLS client for scenario 04
+# ============================================================
+cd /usr/local/src
+wget -q https://www.openssl.org/source/openssl-3.5.2.tar.gz
+tar xf openssl-3.5.2.tar.gz
+cd openssl-3.5.2
+./Configure --prefix=/opt/openssl-3.5 --openssldir=/opt/openssl-3.5/ssl shared zlib
+make -j2
+make install_sw install_ssldirs
+echo "/opt/openssl-3.5/lib64" > /etc/ld.so.conf.d/openssl-3.5.conf
+ldconfig
+
+# ============================================================
+# liboqs — PQ algorithm library (Phase 4 add)
+# ============================================================
+echo "==> Building liboqs"
+cd /usr/local/src
+git clone --depth=1 --branch main https://github.com/open-quantum-safe/liboqs.git
+cd liboqs
+cmake -S . -B build \
+    -GNinja \
+    -DBUILD_SHARED_LIBS=ON \
+    -DOQS_USE_OPENSSL=OFF \
+    -DCMAKE_INSTALL_PREFIX=/opt/liboqs
+cmake --build build
+cmake --install build
+
+echo "/opt/liboqs/lib" > /etc/ld.so.conf.d/liboqs.conf
+ldconfig
+
+# ============================================================
+# oqsprovider — exposes liboqs to OpenSSL at TLS codepoint level
+# NOTE: CMAKE_INSTALL_LIBDIR=lib64 matches OpenSSL's default on arm64
+#       (loadgen OpenSSL Configure used no --libdir, so defaulted to lib64)
+# ============================================================
+echo "==> Building oqsprovider"
+cd /usr/local/src
+git clone --depth=1 --branch main https://github.com/open-quantum-safe/oqs-provider.git
+cd oqs-provider
+cmake -S . -B build \
+    -GNinja \
+    -DOPENSSL_ROOT_DIR=/opt/openssl-3.5 \
+    -Dliboqs_DIR=/opt/liboqs/lib/cmake/liboqs \
+    -DCMAKE_INSTALL_PREFIX=/opt/openssl-3.5 \
+    -DCMAKE_INSTALL_LIBDIR=lib64
+cmake --build build
+cmake --install build
+
+# Activate oqsprovider in openssl.cnf (OpenSSL loads it at init)
+cat > /opt/openssl-3.5/ssl/openssl.cnf <<CNF
+openssl_conf = openssl_init
+
+[openssl_init]
+providers = provider_sect
+
+[provider_sect]
+default = default_sect
+oqsprovider = oqsprovider_sect
+
+[default_sect]
+activate = 1
+
+[oqsprovider_sect]
+activate = 1
+
+[req]
+distinguished_name = req_distinguished_name
+[req_distinguished_name]
+CNF
+
+# Smoke test: oqsprovider loads and SLH-DSA now in TLS sig alg list
+/opt/openssl-3.5/bin/openssl list -providers | grep -q oqsprovider || {
+    echo "FATAL: oqsprovider not activated on loadgen"; exit 1;
+}
+/opt/openssl-3.5/bin/openssl list -tls-signature-algorithms | grep -q slhdsa || {
+    echo "FATAL: SLH-DSA not in TLS sig alg list after oqsprovider load"; exit 1;
+}
+echo "==> loadgen oqsprovider ready, SLH-DSA available as TLS client"
+
+# ============================================================
+# Kernel tuning for outbound TLS load
+# ============================================================
+cat > /etc/sysctl.d/99-pqc-bench.conf <<'SYSCTL'
+net.ipv4.ip_local_port_range = 1024 65535
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.tcp_fin_timeout = 15
+net.core.somaxconn = 65535
+SYSCTL
+sysctl --system
+
+# Give ubuntu user ownership of a scratch directory for scenarios
+mkdir -p /home/ubuntu/scenarios /home/ubuntu/results
+chown -R ubuntu:ubuntu /home/ubuntu/scenarios /home/ubuntu/results
+
+touch /var/lib/pqc-bench-ready
+echo "==> PQC-Bench loadgen ready at $(date -u) (w/ oqsprovider)"

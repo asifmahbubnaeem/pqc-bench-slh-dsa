@@ -1,0 +1,12 @@
+    --filters "Name=tag:Role,Values=target" "Name=instance-state-name,Values=running" \
+    --query 'Reservations[0].Instances[0].InstanceId' --output text)
+echo "Target instance ID: $TARGET_ID"
+
+aws --profile pqc-bench --region us-east-1 ec2 create-image \
+    --instance-id $TARGET_ID \
+    --name "pqc-bench-target-20260920" \
+    --description "nginx-pq + OpenSSL 3.5.0 + ML-DSA-65 cert, Phase 0 verified working" \
+    --no-reboot \
+    --output text
+Target instance ID: i-078f2d64ffb615926
+ami-0439939f24b73421c
