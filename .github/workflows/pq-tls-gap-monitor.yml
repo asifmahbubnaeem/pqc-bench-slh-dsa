@@ -11,7 +11,6 @@
 # so the issue timeline doubles as the historical log.
 #
 # Runs: 1st of every month at 00:00 UTC, plus on manual dispatch.
-# Public repo so Actions minutes are unlimited. ~5-10 min per run.
 
 name: PQ TLS Gap Monitor
 
@@ -32,21 +31,50 @@ jobs:
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build git wget curl ca-certificates
+            build-essential cmake ninja-build git wget curl ca-certificates jq
 
-      - name: Build latest OpenSSL 3.5.x
+      - name: Discover latest OpenSSL 3.5.x
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cd /tmp
-          # Discover latest 3.5.x tarball
-          OPENSSL_VERSION=$(curl -sS https://www.openssl.org/source/ \
-            | grep -oP 'openssl-3\.5\.\d+\.tar\.gz' \
+          echo "::group::Query GitHub Releases API"
+          API_OUT=$(curl -sS \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              "https://api.github.com/repos/openssl/openssl/releases?per_page=100")
+          echo "$API_OUT" | jq -r '.[].tag_name' | head -20
+          echo "::endgroup::"
+
+          OPENSSL_VERSION=$(echo "$API_OUT" \
+            | jq -r '.[].tag_name' \
+            | grep -E '^openssl-3\.5\.[0-9]+$' \
             | sort -V | tail -1 \
-            | sed 's/openssl-//; s/\.tar\.gz//')
+            | sed 's/openssl-//')
+
+          if [ -z "$OPENSSL_VERSION" ]; then
+            echo "::error::Could not discover latest OpenSSL 3.5.x from GitHub Releases API"
+            echo "First 500 chars of API response:"
+            echo "$API_OUT" | head -c 500
+            exit 1
+          fi
           echo "Latest OpenSSL 3.5.x: $OPENSSL_VERSION"
           echo "OPENSSL_VERSION=$OPENSSL_VERSION" >> "$GITHUB_ENV"
 
-          wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
-          tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+      - name: Build OpenSSL
+        run: |
+          cd /tmp
+          TARBALL="openssl-${OPENSSL_VERSION}.tar.gz"
+
+          # Prefer GitHub Releases (what we discovered from). Fall back to openssl.org.
+          URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/${TARBALL}"
+          echo "Fetching $URL"
+          if ! wget -q "$URL"; then
+            echo "GitHub release download failed, trying openssl.org"
+            wget -q "https://www.openssl.org/source/${TARBALL}" \
+              || { echo "::error::Both download sources failed for $TARBALL"; exit 1; }
+          fi
+
+          tar xf "$TARBALL"
           cd "openssl-${OPENSSL_VERSION}"
           ./Configure --prefix=/opt/openssl --libdir=lib shared zlib > /dev/null
           make -j"$(nproc)" > build.log 2>&1 || { tail -40 build.log; exit 1; }
@@ -67,13 +95,13 @@ jobs:
               echo "$FOUND"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-            echo "::notice::Vanilla OpenSSL $OPENSSL_VERSION has SLH-DSA at TLS."
+            echo "::notice::Vanilla OpenSSL $OPENSSL_VERSION has SLH-DSA at TLS"
           else
             echo "status=no" >> "$GITHUB_OUTPUT"
-            echo "No SLH-DSA in vanilla OpenSSL $OPENSSL_VERSION TLS sig algs."
+            echo "No SLH-DSA in vanilla OpenSSL $OPENSSL_VERSION TLS sig algs"
           fi
 
-      - name: Build liboqs
+      - name: Build liboqs (main branch)
         run: |
           cd /tmp
           git clone --depth=1 --branch main \
@@ -88,7 +116,7 @@ jobs:
           echo "/opt/liboqs/lib" | sudo tee /etc/ld.so.conf.d/liboqs.conf > /dev/null
           sudo ldconfig
 
-      - name: Build oqs-provider
+      - name: Build oqs-provider (main branch)
         run: |
           cd /tmp
           git clone --depth=1 --branch main \
@@ -137,10 +165,10 @@ jobs:
               echo "$FOUND"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-            echo "::notice::OpenSSL + oqs-provider $OQS_PROVIDER_VERSION has SLH-DSA at TLS."
+            echo "::notice::OpenSSL + oqs-provider $OQS_PROVIDER_VERSION has SLH-DSA at TLS"
           else
             echo "status=no" >> "$GITHUB_OUTPUT"
-            echo "No SLH-DSA in OpenSSL + oqs-provider TLS sig algs."
+            echo "No SLH-DSA in OpenSSL + oqs-provider TLS sig algs"
           fi
 
       - name: Update tracking issue (append history)
@@ -179,7 +207,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Only alert once per stack+version combo — avoid noise
           ALERT_TITLE="🎉 SLH-DSA at TLS now available (OpenSSL $OPENSSL_VERSION, oqs-provider $OQS_PROVIDER_VERSION)"
           EXISTING=$(gh issue list --label pq-tls-gap-closed --state all \
             --search "$ALERT_TITLE" --json number --jq '.[0].number // empty')
