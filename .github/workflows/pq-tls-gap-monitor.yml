@@ -171,9 +171,22 @@ jobs:
             echo "No SLH-DSA in OpenSSL + oqs-provider TLS sig algs"
           fi
 
+      - name: Ensure labels exist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          gh label create pq-tls-gap-monitor --repo "$REPO" \
+            --description "Running log of monthly PQ TLS gap checks" \
+            --color 0366d6 2>/dev/null || true
+          gh label create pq-tls-gap-closed --repo "$REPO" \
+            --description "Alert: SLH-DSA has arrived in a TLS stack" \
+            --color 22c55e 2>/dev/null || true
+
       - name: Update tracking issue (append history)
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           DATE=$(date -u +%Y-%m-%d)
           BODY=$(cat <<EOF
@@ -188,30 +201,33 @@ jobs:
           EOF
           )
 
-          ISSUE_NUMBER=$(gh issue list --label pq-tls-gap-monitor --state open \
+          ISSUE_NUMBER=$(gh issue list --repo "$REPO" \
+            --label pq-tls-gap-monitor --state open \
             --json number --jq '.[0].number // empty')
 
           if [ -z "$ISSUE_NUMBER" ]; then
-            gh issue create \
+            gh issue create --repo "$REPO" \
               --title "PQ TLS gap monitor: SLH-DSA availability tracking" \
               --label pq-tls-gap-monitor \
               --body "This issue is the running log of monthly checks for SLH-DSA availability in the TLS layer. Each run appends a comment. See the Phase 4 Part 1 blog post for the project context.
 
           $BODY"
           else
-            gh issue comment "$ISSUE_NUMBER" --body "$BODY"
+            gh issue comment "$ISSUE_NUMBER" --repo "$REPO" --body "$BODY"
           fi
 
       - name: Open alert issue if gap has closed
         if: steps.vanilla.outputs.status == 'yes' || steps.oqs.outputs.status == 'yes'
         env:
           GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
         run: |
           ALERT_TITLE="🎉 SLH-DSA at TLS now available (OpenSSL $OPENSSL_VERSION, oqs-provider $OQS_PROVIDER_VERSION)"
-          EXISTING=$(gh issue list --label pq-tls-gap-closed --state all \
+          EXISTING=$(gh issue list --repo "$REPO" \
+            --label pq-tls-gap-closed --state all \
             --search "$ALERT_TITLE" --json number --jq '.[0].number // empty')
           if [ -z "$EXISTING" ]; then
-            gh issue create \
+            gh issue create --repo "$REPO" \
               --title "$ALERT_TITLE" \
               --label pq-tls-gap-closed \
               --body "SLH-DSA has appeared in the TLS signature-algorithm list on at least one stack as of $(date -u +%Y-%m-%d). Phase 4 of pqc-bench can be un-parked and measured.
