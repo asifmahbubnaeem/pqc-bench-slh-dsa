@@ -1,0 +1,200 @@
+# GitHub Actions workflow: monthly PQ TLS gap monitor
+#
+# Checks whether SLH-DSA has arrived in the TLS layer of either:
+#   (1) vanilla OpenSSL (latest 3.5.x), or
+#   (2) OpenSSL + oqs-provider (main branch)
+#
+# Opens a GitHub issue when either answer flips from "no" to "yes" —
+# that's the signal to un-park Phase 4 and measure.
+#
+# A tracking issue (label: pq-tls-gap-monitor) gets a comment every run,
+# so the issue timeline doubles as the historical log.
+#
+# Runs: 1st of every month at 00:00 UTC, plus on manual dispatch.
+# Public repo so Actions minutes are unlimited. ~5-10 min per run.
+
+name: PQ TLS Gap Monitor
+
+on:
+  schedule:
+    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Install build deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build git wget curl ca-certificates
+
+      - name: Build latest OpenSSL 3.5.x
+        run: |
+          cd /tmp
+          # Discover latest 3.5.x tarball
+          OPENSSL_VERSION=$(curl -sS https://www.openssl.org/source/ \
+            | grep -oP 'openssl-3\.5\.\d+\.tar\.gz' \
+            | sort -V | tail -1 \
+            | sed 's/openssl-//; s/\.tar\.gz//')
+          echo "Latest OpenSSL 3.5.x: $OPENSSL_VERSION"
+          echo "OPENSSL_VERSION=$OPENSSL_VERSION" >> "$GITHUB_ENV"
+
+          wget -q "https://www.openssl.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+          tar xf "openssl-${OPENSSL_VERSION}.tar.gz"
+          cd "openssl-${OPENSSL_VERSION}"
+          ./Configure --prefix=/opt/openssl --libdir=lib shared zlib > /dev/null
+          make -j"$(nproc)" > build.log 2>&1 || { tail -40 build.log; exit 1; }
+          sudo make install_sw install_ssldirs > /dev/null
+          echo "/opt/openssl/lib" | sudo tee /etc/ld.so.conf.d/openssl.conf > /dev/null
+          sudo ldconfig
+          /opt/openssl/bin/openssl version
+
+      - name: Check vanilla OpenSSL for SLH-DSA at TLS
+        id: vanilla
+        run: |
+          FOUND=$(/opt/openssl/bin/openssl list -tls-signature-algorithms \
+            | tr ':' '\n' | grep -i slh || true)
+          if [ -n "$FOUND" ]; then
+            echo "status=yes" >> "$GITHUB_OUTPUT"
+            {
+              echo "found<<EOF"
+              echo "$FOUND"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::Vanilla OpenSSL $OPENSSL_VERSION has SLH-DSA at TLS."
+          else
+            echo "status=no" >> "$GITHUB_OUTPUT"
+            echo "No SLH-DSA in vanilla OpenSSL $OPENSSL_VERSION TLS sig algs."
+          fi
+
+      - name: Build liboqs
+        run: |
+          cd /tmp
+          git clone --depth=1 --branch main \
+            https://github.com/open-quantum-safe/liboqs.git
+          cd liboqs
+          cmake -S . -B build -GNinja \
+            -DBUILD_SHARED_LIBS=ON \
+            -DOQS_USE_OPENSSL=OFF \
+            -DCMAKE_INSTALL_PREFIX=/opt/liboqs > /dev/null
+          cmake --build build > build.log 2>&1 || { tail -40 build.log; exit 1; }
+          sudo cmake --install build > /dev/null
+          echo "/opt/liboqs/lib" | sudo tee /etc/ld.so.conf.d/liboqs.conf > /dev/null
+          sudo ldconfig
+
+      - name: Build oqs-provider
+        run: |
+          cd /tmp
+          git clone --depth=1 --branch main \
+            https://github.com/open-quantum-safe/oqs-provider.git
+          cd oqs-provider
+          OQS_VERSION=$(git describe --tags --always 2>/dev/null || echo "main-HEAD")
+          echo "OQS_PROVIDER_VERSION=$OQS_VERSION" >> "$GITHUB_ENV"
+
+          cmake -S . -B build -GNinja \
+            -DOPENSSL_ROOT_DIR=/opt/openssl \
+            -Dliboqs_DIR=/opt/liboqs/lib/cmake/liboqs \
+            -DCMAKE_INSTALL_PREFIX=/opt/openssl \
+            -DCMAKE_INSTALL_LIBDIR=lib > /dev/null
+          cmake --build build > build.log 2>&1 || { tail -40 build.log; exit 1; }
+          sudo cmake --install build > /dev/null
+
+          # Activate oqsprovider alongside default
+          sudo tee /opt/openssl/ssl/openssl.cnf > /dev/null <<'CNF'
+          openssl_conf = openssl_init
+
+          [openssl_init]
+          providers = provider_sect
+
+          [provider_sect]
+          default = default_sect
+          oqsprovider = oqsprovider_sect
+
+          [default_sect]
+          activate = 1
+
+          [oqsprovider_sect]
+          activate = 1
+          CNF
+
+          /opt/openssl/bin/openssl list -providers
+
+      - name: Check OpenSSL + oqs-provider for SLH-DSA at TLS
+        id: oqs
+        run: |
+          FOUND=$(/opt/openssl/bin/openssl list -tls-signature-algorithms \
+            | tr ':' '\n' | grep -i slh || true)
+          if [ -n "$FOUND" ]; then
+            echo "status=yes" >> "$GITHUB_OUTPUT"
+            {
+              echo "found<<EOF"
+              echo "$FOUND"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "::notice::OpenSSL + oqs-provider $OQS_PROVIDER_VERSION has SLH-DSA at TLS."
+          else
+            echo "status=no" >> "$GITHUB_OUTPUT"
+            echo "No SLH-DSA in OpenSSL + oqs-provider TLS sig algs."
+          fi
+
+      - name: Update tracking issue (append history)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          DATE=$(date -u +%Y-%m-%d)
+          BODY=$(cat <<EOF
+          **Check date:** $DATE (run #${{ github.run_number }})
+
+          | Stack | OpenSSL version | oqs-provider version | SLH-DSA at TLS? |
+          |---|---|---|---|
+          | Vanilla OpenSSL | $OPENSSL_VERSION | — | **${{ steps.vanilla.outputs.status }}** |
+          | OpenSSL + oqs-provider | $OPENSSL_VERSION | $OQS_PROVIDER_VERSION | **${{ steps.oqs.outputs.status }}** |
+
+          [Run details](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )
+
+          ISSUE_NUMBER=$(gh issue list --label pq-tls-gap-monitor --state open \
+            --json number --jq '.[0].number // empty')
+
+          if [ -z "$ISSUE_NUMBER" ]; then
+            gh issue create \
+              --title "PQ TLS gap monitor: SLH-DSA availability tracking" \
+              --label pq-tls-gap-monitor \
+              --body "This issue is the running log of monthly checks for SLH-DSA availability in the TLS layer. Each run appends a comment. See the Phase 4 Part 1 blog post for the project context.
+
+          $BODY"
+          else
+            gh issue comment "$ISSUE_NUMBER" --body "$BODY"
+          fi
+
+      - name: Open alert issue if gap has closed
+        if: steps.vanilla.outputs.status == 'yes' || steps.oqs.outputs.status == 'yes'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Only alert once per stack+version combo — avoid noise
+          ALERT_TITLE="🎉 SLH-DSA at TLS now available (OpenSSL $OPENSSL_VERSION, oqs-provider $OQS_PROVIDER_VERSION)"
+          EXISTING=$(gh issue list --label pq-tls-gap-closed --state all \
+            --search "$ALERT_TITLE" --json number --jq '.[0].number // empty')
+          if [ -z "$EXISTING" ]; then
+            gh issue create \
+              --title "$ALERT_TITLE" \
+              --label pq-tls-gap-closed \
+              --body "SLH-DSA has appeared in the TLS signature-algorithm list on at least one stack as of $(date -u +%Y-%m-%d). Phase 4 of pqc-bench can be un-parked and measured.
+
+          **Vanilla OpenSSL:** ${{ steps.vanilla.outputs.status }}
+          **With oqs-provider:** ${{ steps.oqs.outputs.status }}
+
+          Found entries:
+          \`\`\`
+          ${{ steps.vanilla.outputs.found }}
+          ${{ steps.oqs.outputs.found }}
+          \`\`\`"
+          fi
