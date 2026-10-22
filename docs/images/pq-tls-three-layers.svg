@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 380" width="640" height="380" role="img" aria-labelledby="title desc">
+  <title id="title">Three layers of PQ TLS support, ML-DSA vs SLH-DSA, October 2026</title>
+  <desc id="desc">ML-DSA-65 has all three layers of TLS support (cryptographic primitives, X.509 encoding, TLS protocol integration). SLH-DSA-SHA2-128f has only the first two. The TLS protocol layer for SLH-DSA is missing.</desc>
+  <style>
+    .title    { font: 600 18px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .subtitle { font: 400 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; opacity: .7; }
+    .header   { font: 600 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .label    { font: 500 14px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    .sublabel { font: 400 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; opacity: .55; }
+    .status   { font: 700 22px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    text        { fill: #1f2328; }
+    .ok-cell    { fill: #dcfce7; stroke: #16a34a; stroke-width: 1; }
+    .ok-text    { fill: #15803d; }
+    .fail-cell  { fill: #fee2e2; stroke: #dc2626; stroke-width: 1.5; stroke-dasharray: 6 3; }
+    .fail-text  { fill: #991b1b; }
+    @media (prefers-color-scheme: dark) {
+      text        { fill: #e6edf3; }
+      .ok-cell    { fill: #0d2419; stroke: #22c55e; }
+      .ok-text    { fill: #4ade80; }
+      .fail-cell  { fill: #2a0d0d; stroke: #ef4444; }
+      .fail-text  { fill: #f87171; }
+    }
+  </style>
+  <text x="320" y="30" text-anchor="middle" class="title">Three layers of PQ TLS support</text>
+  <text x="320" y="50" text-anchor="middle" class="subtitle">OpenSSL 3.5.2 + oqs-provider 0.12.0-dev, October 2026</text>
+  <text x="330" y="90" text-anchor="middle" class="header">ML-DSA-65</text>
+  <text x="500" y="90" text-anchor="middle" class="header">SLH-DSA-SHA2-128f</text>
+  <text x="20"  y="130" class="label">TLS protocol integration</text>
+  <text x="20"  y="146" class="sublabel">ClientHello sig_algs ext, SSL_CTX_use_certificate, CertificateVerify</text>
+  <rect x="275" y="115" width="110" height="40" rx="4" class="ok-cell"/>
+  <text x="330" y="143" text-anchor="middle" class="ok-text status">✓</text>
+  <rect x="420" y="115" width="160" height="40" rx="4" class="fail-cell"/>
+  <text x="500" y="143" text-anchor="middle" class="fail-text status">✗</text>
+  <text x="20"  y="200" class="label">X.509 encoding</text>
+  <text x="20"  y="216" class="sublabel">OIDs recognised when parsing cert ASN.1</text>
+  <rect x="275" y="185" width="110" height="40" rx="4" class="ok-cell"/>
+  <text x="330" y="213" text-anchor="middle" class="ok-text status">✓</text>
+  <rect x="420" y="185" width="160" height="40" rx="4" class="ok-cell"/>
+  <text x="500" y="213" text-anchor="middle" class="ok-text status">✓</text>
+  <text x="20"  y="270" class="label">Cryptographic primitives</text>
+  <text x="20"  y="286" class="sublabel">keygen, sign, verify</text>
+  <rect x="275" y="255" width="110" height="40" rx="4" class="ok-cell"/>
+  <text x="330" y="283" text-anchor="middle" class="ok-text status">✓</text>
+  <rect x="420" y="255" width="160" height="40" rx="4" class="ok-cell"/>
+  <text x="500" y="283" text-anchor="middle" class="ok-text status">✓</text>
+  <text x="320" y="335" text-anchor="middle" class="subtitle">SLH-DSA has layers 1 and 2 but no TLS integration.</text>
+  <text x="320" y="355" text-anchor="middle" class="subtitle">You can sign with SLH-DSA. You cannot serve it over TLS.</text>
+</svg>
